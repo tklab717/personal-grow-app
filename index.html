@@ -171,7 +171,7 @@
   var tform=blankTask(),dform=blankDiary(),compareDate=null;
 
   function blankTask(){return{id:null,domain:"work",title:"",desc:"",start:today(),end:addDays(today(),14),goalId:""};}
-  function blankDiary(){return{id:null,date:today(),mood:3,text:"",taskIds:[]};}
+  function blankDiary(){return{id:null,date:today(),mood:3,text:"",taskIds:[],coachLog:[]};}
   function load(k,d){try{return JSON.parse(localStorage.getItem(k))||d}catch(e){return d}}
   function save(){localStorage.setItem(TKEY,JSON.stringify(tasks));localStorage.setItem(DKEY,JSON.stringify(diary));localStorage.setItem(GKEY,JSON.stringify(goals));scheduleAutoSave();}
   function today(){return new Date().toISOString().slice(0,10);}
@@ -344,29 +344,38 @@
         '<input id="wurl" class="input" placeholder="https://....workers.dev" style="font-size:12px;margin-bottom:8px">'+
         '<button id="wsave" style="font-size:12px;font-weight:700;color:#fff;background:var(--accent);border:none;border-radius:9px;padding:8px 14px;cursor:pointer">\u767b\u9332</button></div>';
     }
-    var inner='';
-    if(coachState.loading){
-      inner='<div style="text-align:center;color:var(--accent);font-size:13px;padding:14px 0">\uD83E\uDD14 \u5225\u306e\u8996\u70b9\u3092\u8003\u3048\u3066\u3044\u307e\u3059\u2026</div>';
-    }else if(coachState.error){
-      inner='<div style="font-size:12px;color:var(--red);padding:8px 0">'+esc(coachState.error)+'</div>';
-    }else if(coachState.result){
-      var r=coachState.result;
-      var items=(r.perspectives||[]).map(function(p){
+    // 保存済みコメント履歴（古い順）を描画
+    var log=dform.coachLog||[];
+    var logHtml=log.map(function(entry,idx){
+      var items=(entry.perspectives||[]).map(function(p){
         return '<div style="display:flex;gap:9px;padding:9px 11px;border-radius:11px;background:#fff;border:1px solid var(--border);margin-bottom:7px">'+
           '<span style="font-size:16px;flex:0 0 auto">'+esc(p.icon||"\uD83D\uDCA1")+'</span>'+
           '<div><div style="font-size:11px;font-weight:700;color:var(--accent);margin-bottom:2px">'+esc(p.label||"")+'</div>'+
           '<div style="font-size:13px;line-height:1.65;color:var(--ink)">'+esc(p.text||"")+'</div></div></div>';
       }).join("");
-      var q=r.question?'<div style="margin-top:8px;padding:10px 12px;border-radius:11px;background:linear-gradient(135deg,rgba(108,92,231,.1),rgba(11,187,214,.08));font-size:13px;font-weight:600;color:var(--accent)">\u2753 '+esc(r.question)+'</div>':'';
-      inner='<div style="margin-bottom:8px">'+items+q+'</div>'+
-        '<button id="coachBtn" style="font-size:12px;color:var(--accent);background:none;border:none;cursor:pointer;font-weight:600">\uD83D\uDD04 \u3082\u3046\u4e00\u5ea6\u8996\u70b9\u3092\u3082\u3089\u3046</button>';
+      var q=entry.question?'<div style="margin-top:8px;padding:10px 12px;border-radius:11px;background:linear-gradient(135deg,rgba(108,92,231,.1),rgba(11,187,214,.08));font-size:13px;font-weight:600;color:var(--accent)">\u2753 '+esc(entry.question)+'</div>':'';
+      var when="";
+      try{var dt=new Date(entry.at);when=(dt.getMonth()+1)+"/"+dt.getDate()+" "+dt.getHours()+":"+("0"+dt.getMinutes()).slice(-2);}catch(e){}
+      var del='<button class="coach-del" data-cidx="'+idx+'" style="font-size:10px;color:var(--muted);background:none;border:none;cursor:pointer">\u524a\u9664</button>';
+      return '<div style="margin-bottom:12px;padding-bottom:10px;'+(idx<log.length-1?'border-bottom:1px dashed var(--border)':'')+'">'+
+        '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">'+
+          '<span style="font-size:10px;color:var(--muted);font-weight:600">\uD83D\uDCAC '+(log.length>1?(idx+1)+'\u56de\u76ee \u00b7 ':'')+when+'</span>'+del+'</div>'+
+        items+q+'</div>';
+    }).join("");
+
+    var inner=logHtml;
+    if(coachState.loading){
+      inner+='<div style="text-align:center;color:var(--accent);font-size:13px;padding:14px 0">\uD83E\uDD14 \u5225\u306e\u8996\u70b9\u3092\u8003\u3048\u3066\u3044\u307e\u3059\u2026</div>';
+    }else if(coachState.error){
+      inner+='<div style="font-size:12px;color:var(--red);padding:8px 0">'+esc(coachState.error)+'</div>';
     }
-    if(!coachState.loading&&!coachState.result){
-      inner+='<button id="coachBtn" class="btn" style="width:100%;font-size:14px;background:linear-gradient(135deg,#0bbbd6,#16c79a);box-shadow:0 6px 18px rgba(11,187,214,.25)">\uD83E\uDD16 \u8996\u70b9\u3092\u3082\u3089\u3046</button>';
+    if(!coachState.loading){
+      var label=log.length?'\uD83D\uDD04 \u3082\u3046\u4e00\u5ea6\u8996\u70b9\u3092\u3082\u3089\u3046':'\uD83E\uDD16 \u8996\u70b9\u3092\u3082\u3089\u3046';
+      inner+='<button id="coachBtn" class="btn" style="width:100%;font-size:14px;background:linear-gradient(135deg,#0bbbd6,#16c79a);box-shadow:0 6px 18px rgba(11,187,214,.25)">'+label+'</button>';
     }
     return '<div style="padding:13px 14px;border-radius:13px;background:#f7f8fc;border:1px solid var(--border)">'+
       '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:9px">'+
-        '<span style="font-size:12px;font-weight:700;color:var(--accent)">\uD83E\uDD16 AI\u30b3\u30fc\u30c1</span>'+
+        '<span style="font-size:12px;font-weight:700;color:var(--accent)">\uD83E\uDD16 AI\u30b3\u30fc\u30c1'+(log.length?'\uFF08'+log.length+'\u4ef6\uFF09':'')+'</span>'+
         '<button id="wreset" style="font-size:10px;color:var(--muted);background:none;border:none;cursor:pointer">\u8a2d\u5b9a</button></div>'+
       inner+'</div>';
   }
@@ -383,7 +392,16 @@
       .then(function(res){return res.json().then(function(j){return{ok:res.ok,j:j};});})
       .then(function(o){coachState.loading=false;
         if(!o.ok){coachState.error=(o.j&&o.j.error)?o.j.error:"\u30a8\u30e9\u30fc\u304c\u767a\u751f\u3057\u307e\u3057\u305f";}
-        else{coachState.result=o.j;}
+        else{
+          // 取得したコメントを日記の履歴に追記（保存対象）
+          if(!dform.coachLog)dform.coachLog=[];
+          dform.coachLog.push({at:new Date().toISOString(),perspectives:o.j.perspectives||[],question:o.j.question||""});
+          // 既存の日記なら即座に保存（閉じても残る）
+          if(dform.id){
+            diary=diary.map(function(x){return x.id===dform.id?JSON.parse(JSON.stringify(dform)):x;});
+            save();
+          }
+        }
         refreshCoach();})
       .catch(function(){coachState.loading=false;coachState.error="\u63a5\u7d9a\u306b\u5931\u6557\u3057\u307e\u3057\u305f\u3002URL\u3092\u78ba\u8a8d\u3057\u3066\u304f\u3060\u3055\u3044\u3002";refreshCoach();});
   }
@@ -399,7 +417,9 @@
     var ws=document.getElementById("wsave");
     if(ws)ws.onclick=function(){var u=document.getElementById("wurl");if(u&&u.value.trim()){workerUrl=u.value.trim();localStorage.setItem(WKEY,workerUrl);refreshCoach();}};
     var wr=document.getElementById("wreset");
-    if(wr)wr.onclick=function(){if(confirm("\u4e2d\u7d99\u30b5\u30fc\u30d0\u30fcURL\u3092\u518d\u8a2d\u5b9a\u3057\u307e\u3059\u304b\uff1f")){workerUrl="";localStorage.removeItem(WKEY);coachState.result=null;refreshCoach();}};
+    if(wr)wr.onclick=function(){if(confirm("\u4e2d\u7d99\u30b5\u30fc\u30d0\u30fcURL\u3092\u518d\u8a2d\u5b9a\u3057\u307e\u3059\u304b\uff1f")){workerUrl="";localStorage.removeItem(WKEY);refreshCoach();}};
+    document.querySelectorAll(".coach-del").forEach(function(b){b.onclick=function(){
+      var i=+b.dataset.cidx;if(dform.coachLog&&dform.coachLog[i]!==undefined){dform.coachLog.splice(i,1);refreshCoach();}};});
   }
 
   function diarySheet(){
@@ -628,7 +648,7 @@
     document.querySelectorAll("[data-task]").forEach(function(b){b.onclick=function(){
       var t=tasks.filter(function(x){return x.id==b.dataset.task;})[0];if(t){tform=JSON.parse(JSON.stringify(t));showSheet="task";render();}};});
     document.querySelectorAll("[data-diary]").forEach(function(b){b.onclick=function(){
-      var e=diary.filter(function(x){return x.id==b.dataset.diary;})[0];if(e){dform=JSON.parse(JSON.stringify(e));if(!dform.taskIds)dform.taskIds=[];compareDate=null;coachState={loading:false,result:null,error:null};showSheet="diary";render();}};});
+      var e=diary.filter(function(x){return x.id==b.dataset.diary;})[0];if(e){dform=JSON.parse(JSON.stringify(e));if(!dform.taskIds)dform.taskIds=[];if(!dform.coachLog)dform.coachLog=[];compareDate=null;coachState={loading:false,result:null,error:null};showSheet="diary";render();}};});
 
     var modal=document.getElementById("modal");
     if(modal){
