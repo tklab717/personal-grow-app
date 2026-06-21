@@ -458,15 +458,29 @@
     gTokenClient=google.accounts.oauth2.initTokenClient({
       client_id:GCLIENT_ID, scope:GSCOPE,
       callback:function(resp){
+        if(gAuthTimer){clearTimeout(gAuthTimer);gAuthTimer=null;}
         if(resp&&resp.access_token){ gToken=resp.access_token; if(gPending){var f=gPending;gPending=null;f();} }
-        else { setSync("error","\u8a8d\u8a3c\u306b\u5931\u6557\u3057\u307e\u3057\u305f"); }
+        else { gPending=null; setSync("error","\u8a8d\u8a3c\u306b\u5931\u6557\u3057\u307e\u3057\u305f\u3002\u300c\u4fdd\u5b58\u300d\u3092\u62bc\u3057\u3066\u518d\u30ed\u30b0\u30a4\u30f3\u3057\u3066\u304f\u3060\u3055\u3044"); }
+      },
+      error_callback:function(){
+        if(gAuthTimer){clearTimeout(gAuthTimer);gAuthTimer=null;}
+        gPending=null;
+        setSync("error","\u518d\u30ed\u30b0\u30a4\u30f3\u304c\u5fc5\u8981\u3067\u3059\u3002\u300c\u4fdd\u5b58\u300d\u3092\u62bc\u3057\u3066\u304f\u3060\u3055\u3044");
       }
     });
   }
-  var gPending=null;
-  function gAuth(then){
+  var gPending=null, gAuthTimer=null;
+  function gAuth(then,interactive){
     if(!gReady()){ setSync("error","Google\u8aad\u307f\u8fbc\u307f\u4e2d\u3002\u6570\u79d2\u5f8c\u306b\u518d\u8a66\u884c\u3057\u3066\u304f\u3060\u3055\u3044"); return; }
     gInit(); gPending=then;
+    // 既にトークンがあればそのまま実行（再認証不要）
+    if(gToken && !interactive){ var f=gPending;gPending=null;f(); return; }
+    // タイムアウト保険：8秒で応答がなければ状態を戻す
+    if(gAuthTimer)clearTimeout(gAuthTimer);
+    gAuthTimer=setTimeout(function(){
+      gAuthTimer=null; gPending=null;
+      setSync("error","\u63a5\u7d9a\u304c\u5b8c\u4e86\u3057\u307e\u305b\u3093\u3067\u3057\u305f\u3002\u300c\u4fdd\u5b58\u300d\u3092\u62bc\u3057\u3066\u518d\u8a66\u884c\u3057\u3066\u304f\u3060\u3055\u3044");
+    },8000);
     gTokenClient.requestAccessToken({prompt: gToken?"":"consent"});
   }
 
@@ -498,11 +512,12 @@
           headers:{Authorization:"Bearer "+gToken,"Content-Type":"multipart/related; boundary="+boundary},
           body:body});
       }).then(function(r){
+        if(r.status===401){ gToken=null; setSync("error","\u30ed\u30b0\u30a4\u30f3\u671f\u9650\u5207\u308c\u3002\u300c\u4fdd\u5b58\u300d\u3092\u3082\u3046\u4e00\u5ea6\u62bc\u3057\u3066\u304f\u3060\u3055\u3044"); return; }
         if(!r.ok)throw new Error();
         var n=new Date();
         setSync("ok",(silent?"\u81ea\u52d5\u4fdd\u5b58 \u00b7 ":"\u4fdd\u5b58\u3057\u307e\u3057\u305f \u00b7 ")+n.getHours()+":"+("0"+n.getMinutes()).slice(-2));
-      }).catch(function(){ setSync("error","\u4fdd\u5b58\u306b\u5931\u6557\u3057\u307e\u3057\u305f"); });
-    });
+      }).catch(function(){ setSync("error","\u4fdd\u5b58\u306b\u5931\u6557\u3057\u307e\u3057\u305f\u3002\u300c\u4fdd\u5b58\u300d\u3067\u518d\u8a66\u884c"); });
+    }, !silent);   // 手動保存はinteractive（必ず再ログイン可能）
   }
 
   function gLoad(silent){
@@ -511,7 +526,10 @@
       gFind().then(function(id){
         if(!id){ if(!silent)setSync("error","\u30af\u30e9\u30a6\u30c9\u306b\u30c7\u30fc\u30bf\u304c\u307e\u3060\u3042\u308a\u307e\u305b\u3093"); else setSync("idle",""); return null; }
         return fetch("https://www.googleapis.com/drive/v3/files/"+id+"?alt=media",
-          {headers:{Authorization:"Bearer "+gToken}}).then(function(r){return r.json();});
+          {headers:{Authorization:"Bearer "+gToken}}).then(function(r){
+            if(r.status===401){ gToken=null; setSync("error","\u30ed\u30b0\u30a4\u30f3\u671f\u9650\u5207\u308c\u3002\u300c\u8aad\u307f\u8fbc\u3080\u300d\u3092\u3082\u3046\u4e00\u5ea6\u62bc\u3057\u3066\u304f\u3060\u3055\u3044"); return null; }
+            return r.json();
+          });
       }).then(function(data){
         if(!data)return;
         if(data.tasks)tasks=data.tasks;
@@ -523,14 +541,14 @@
         setSync("ok",silent?"\u30af\u30e9\u30a6\u30c9\u3068\u540c\u671f\u6e08\u307f":"\u8aad\u307f\u8fbc\u307f\u307e\u3057\u305f");
         render();
       }).catch(function(){ if(!silent)setSync("error","\u8aad\u307f\u8fbc\u307f\u306b\u5931\u6557\u3057\u307e\u3057\u305f"); });
-    });
+    }, !silent);
   }
 
   // 変更後3秒でまとめて自動保存（デバウンス）
   function scheduleAutoSave(){
     if(!autoSync||!gToken)return;
     if(autoSaveTimer)clearTimeout(autoSaveTimer);
-    setSync("busy","\u5909\u66f4\u3092\u4fdd\u5b58\u4e88\u5b9a\u2026");
+    setSync("busy","\u672a\u4fdd\u5b58\u306e\u5909\u66f4\u3042\u308a\u2026");
     autoSaveTimer=setTimeout(function(){autoSaveTimer=null;gSave(true);},3000);
   }
 
