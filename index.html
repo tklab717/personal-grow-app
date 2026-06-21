@@ -102,7 +102,15 @@
   .diary-date{font-size:11px;color:var(--accent);font-weight:700;margin-bottom:6px;}
   .diary-text{font-size:13px;line-height:1.7;white-space:pre-wrap;}
   .row-tap{cursor:pointer;}
+  /* cloud sync */
+  .sync-row{display:flex;gap:9px;align-items:center;}
+  .sync-btn{flex:1;border:none;border-radius:11px;padding:11px;font-size:13px;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px;}
+  .sync-btn.primary{background:linear-gradient(135deg,#4285f4,#3a6ea8);color:#fff;}
+  .sync-btn.ghost{background:#fff;border:1.5px solid var(--border);color:var(--ink);}
+  .sync-btn:active{transform:scale(.97);}
+  .sync-status{font-size:11px;color:var(--muted);margin-top:8px;text-align:center;line-height:1.6;}
 </style>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
 <body>
 <div id="app"></div>
@@ -118,6 +126,13 @@
   var TKEY="grow_tasks_v2",DKEY="grow_diary_v2",GKEY="grow_goals_v2",WKEY="grow_worker_url";
   var workerUrl=localStorage.getItem(WKEY)||"";
   var coachState={loading:false,result:null,error:null};
+
+  // ── Google Drive 同期 ──
+  var GCLIENT_ID="655655081248-9c1l0hop7kmjrkl44eaa8vn4ugj5e0nj.apps.googleusercontent.com";
+  var GSCOPE="https://www.googleapis.com/auth/drive.appdata";
+  var GFILE="grow_data.json";
+  var gToken=null, gTokenClient=null, gFileId=null;
+  var syncState={status:"idle",msg:""}; // idle|busy|ok|error
 
   var tasks=load(TKEY,[]),diary=load(DKEY,[]),goals=load(GKEY,[]);
   var tab="home",range="1m",showSheet=null;
@@ -174,7 +189,8 @@
           '<div><div class="stat-num" style="color:var(--accent)">'+activeTasks+'</div><div class="stat-lbl">\u9032\u884c\u4e2d\u306e\u9805\u76ee</div></div>'+
           '<div><div class="stat-num" style="color:var(--green)">'+totalDiary+'</div><div class="stat-lbl">\u65e5\u8a18\u306e\u6570</div></div></div></div>'+
       '<div class="card"><div class="label">\u3053\u308c\u304b\u3089\u53d6\u308a\u7d44\u3080\u3053\u3068</div>'+upHtml+'</div>'+
-      '<div class="card"><div class="label">\u9818\u57df\u30d0\u30e9\u30f3\u30b9\uff08\u9032\u884c\u4e2d\uff09</div>'+bal+'</div>';
+      '<div class="card"><div class="label">\u9818\u57df\u30d0\u30e9\u30f3\u30b9\uff08\u9032\u884c\u4e2d\uff09</div>'+bal+'</div>'+
+      '<div class="card"><div class="label">\u2601\uFE0F \u30af\u30e9\u30a6\u30c9\u540c\u671f</div><div id="syncBox">'+syncInner()+'</div></div>';
   }
 
   function plan(){
@@ -386,6 +402,104 @@
     '</div></div>';
   }
 
+  // ────────── Google Drive 同期ロジック ──────────
+  function gReady(){ return typeof google!=="undefined" && google.accounts && google.accounts.oauth2; }
+
+  function gInit(){
+    if(gTokenClient||!gReady())return;
+    gTokenClient=google.accounts.oauth2.initTokenClient({
+      client_id:GCLIENT_ID, scope:GSCOPE,
+      callback:function(resp){
+        if(resp&&resp.access_token){ gToken=resp.access_token; if(gPending){var f=gPending;gPending=null;f();} }
+        else { setSync("error","\u8a8d\u8a3c\u306b\u5931\u6557\u3057\u307e\u3057\u305f"); }
+      }
+    });
+  }
+  var gPending=null;
+  function gAuth(then){
+    if(!gReady()){ setSync("error","Google\u8aad\u307f\u8fbc\u307f\u4e2d\u3002\u6570\u79d2\u5f8c\u306b\u518d\u8a66\u884c\u3057\u3066\u304f\u3060\u3055\u3044"); return; }
+    gInit(); gPending=then;
+    gTokenClient.requestAccessToken({prompt: gToken?"":"consent"});
+  }
+
+  // appDataFolder 内の grow_data.json を探す
+  function gFind(){
+    return fetch("https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&fields=files(id,name)&pageSize=10",
+      {headers:{Authorization:"Bearer "+gToken}})
+      .then(function(r){return r.json();})
+      .then(function(j){
+        var f=(j.files||[]).filter(function(x){return x.name===GFILE;})[0];
+        gFileId=f?f.id:null; return gFileId;
+      });
+  }
+
+  function gSave(){
+    setSync("busy","\u4fdd\u5b58\u4e2d\u2026"); 
+    gAuth(function(){
+      var payload={tasks:tasks,diary:diary,goals:goals,savedAt:new Date().toISOString()};
+      var meta={name:GFILE,mimeType:"application/json"};
+      gFind().then(function(id){
+        var boundary="grow"+Date.now();
+        var body="--"+boundary+"\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n"+
+          JSON.stringify(id?{}:{name:GFILE,parents:["appDataFolder"]})+"\r\n"+
+          "--"+boundary+"\r\nContent-Type: application/json\r\n\r\n"+
+          JSON.stringify(payload)+"\r\n--"+boundary+"--";
+        var url=id
+          ? "https://www.googleapis.com/upload/drive/v3/files/"+id+"?uploadType=multipart"
+          : "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart";
+        return fetch(url,{method:id?"PATCH":"POST",
+          headers:{Authorization:"Bearer "+gToken,"Content-Type":"multipart/related; boundary="+boundary},
+          body:body});
+      }).then(function(r){
+        if(!r.ok)throw new Error();
+        var n=new Date();
+        setSync("ok","\u4fdd\u5b58\u3057\u307e\u3057\u305f \u00b7 "+n.getHours()+":"+("0"+n.getMinutes()).slice(-2));
+      }).catch(function(){ setSync("error","\u4fdd\u5b58\u306b\u5931\u6557\u3057\u307e\u3057\u305f"); });
+    });
+  }
+
+  function gLoad(){
+    setSync("busy","\u8aad\u307f\u8fbc\u307f\u4e2d\u2026");
+    gAuth(function(){
+      gFind().then(function(id){
+        if(!id){ setSync("error","\u30af\u30e9\u30a6\u30c9\u306b\u30c7\u30fc\u30bf\u304c\u307e\u3060\u3042\u308a\u307e\u305b\u3093"); return null; }
+        return fetch("https://www.googleapis.com/drive/v3/files/"+id+"?alt=media",
+          {headers:{Authorization:"Bearer "+gToken}}).then(function(r){return r.json();});
+      }).then(function(data){
+        if(!data)return;
+        if(data.tasks)tasks=data.tasks;
+        if(data.diary)diary=data.diary;
+        if(data.goals)goals=data.goals;
+        save();
+        setSync("ok","\u8aad\u307f\u8fbc\u307f\u307e\u3057\u305f");
+        render();
+      }).catch(function(){ setSync("error","\u8aad\u307f\u8fbc\u307f\u306b\u5931\u6557\u3057\u307e\u3057\u305f"); });
+    });
+  }
+
+  function setSync(status,msg){
+    syncState={status:status,msg:msg};
+    var box=document.getElementById("syncBox");
+    if(box){box.innerHTML=syncInner();bindSync();}
+  }
+
+  function syncInner(){
+    var st=syncState;
+    var badge=st.status==="ok"?'<span style="color:var(--green)">\u2713 '+esc(st.msg)+'</span>'
+      :st.status==="error"?'<span style="color:var(--red)">'+esc(st.msg)+'</span>'
+      :st.status==="busy"?'<span style="color:var(--accent)">'+esc(st.msg)+'</span>'
+      :'<span>iPhone\u30fbPC\u9593\u3067\u30c7\u30fc\u30bf\u3092\u540c\u671f\u3067\u304d\u307e\u3059</span>';
+    return '<div class="sync-row">'+
+      '<button class="sync-btn primary" id="syncSave">\u2601\uFE0F \u30af\u30e9\u30a6\u30c9\u306b\u4fdd\u5b58</button>'+
+      '<button class="sync-btn ghost" id="syncLoad">\u2B07\uFE0F \u8aad\u307f\u8fbc\u3080</button>'+
+      '</div><div class="sync-status">'+badge+'</div>';
+  }
+
+  function bindSync(){
+    var s=document.getElementById("syncSave");if(s)s.onclick=gSave;
+    var l=document.getElementById("syncLoad");if(l)l.onclick=gLoad;
+  }
+
   function render(){
     var app=document.getElementById("app");
     app.innerHTML=
@@ -402,6 +516,7 @@
   }
 
   function bind(){
+    bindSync();
     var tb=document.querySelectorAll("[data-tab]");tb.forEach(function(b){b.onclick=function(){tab=b.dataset.tab;showSheet=null;render();};});
     document.querySelectorAll("[data-range]").forEach(function(b){b.onclick=function(){range=b.dataset.range;render();};});
     var fab=document.getElementById("fab");
