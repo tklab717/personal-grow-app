@@ -114,6 +114,23 @@
     color:var(--text);font-size:18px;display:flex;flex-direction:column;align-items:center;gap:2px;}
   .dom-pick .nm{font-size:9px;color:var(--muted);}
   .empty{text-align:center;color:var(--muted);font-size:13px;padding:28px 16px;line-height:1.7;}
+  .todo-row{display:flex;align-items:center;gap:11px;padding:10px 0;border-bottom:1px solid var(--border);}
+  .todo-row:last-child{border-bottom:none;}
+  .todo-check{flex:0 0 26px;width:26px;height:26px;border-radius:50%;border:2px solid var(--c,#ccc);
+    background:#fff;color:#fff;font-size:14px;font-weight:800;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all .15s;padding:0;line-height:1;}
+  .todo-check.on{background:var(--c,#16c79a);border-color:var(--c,#16c79a);box-shadow:0 2px 8px -1px var(--c,#16c79a);}
+  .todo-check:active{transform:scale(.88);}
+  .todo-main{flex:1;min-width:0;}
+  .todo-title{font-size:14px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .todo-sub{font-size:10.5px;color:var(--muted);margin-top:1px;}
+  .todo-row.done .todo-title{color:var(--muted);text-decoration:line-through;}
+  .freq-segwrap{display:flex;gap:6px;}
+  .freq-seg{flex:1;padding:9px 0;border-radius:10px;border:1.5px solid var(--border);background:#fff;color:var(--muted);font-size:12.5px;font-weight:700;cursor:pointer;}
+  .freq-seg.on{background:var(--accent);border-color:var(--accent);color:#fff;}
+  .freq-num{width:30px;height:30px;border-radius:8px;border:1.5px solid var(--border);background:#fff;color:var(--ink);font-size:13px;font-weight:700;cursor:pointer;padding:0;}
+  .freq-num.on{background:var(--accent);border-color:var(--accent);color:#fff;}
+  .freq-wd{flex:1;height:34px;border-radius:8px;border:1.5px solid var(--border);background:#fff;color:var(--ink);font-size:12.5px;font-weight:700;cursor:pointer;padding:0;}
+  .freq-wd.on{background:var(--accent);border-color:var(--accent);color:#fff;}
   .chip{display:inline-flex;align-items:center;gap:4px;font-size:11px;padding:3px 9px;border-radius:20px;
     background:var(--surface);border:1px solid var(--border);color:var(--muted);}
   .tagchip{display:inline-flex;align-items:center;gap:5px;font-size:12px;font-weight:600;
@@ -170,7 +187,7 @@
   var tab="home",range="1m",showSheet=null;
   var tform=blankTask(),dform=blankDiary(),compareDate=null;
 
-  function blankTask(){return{id:null,domain:"work",title:"",desc:"",start:today(),end:addDays(today(),14),goalId:""};}
+  function blankTask(){return{id:null,domain:"work",title:"",desc:"",start:today(),end:addDays(today(),14),goalId:"",freq:{type:"daily",times:3,days:[]},done:[]};}
   function blankDiary(){return{id:null,date:today(),mood:3,text:"",taskIds:[],coachLog:[]};}
   function load(k,d){try{return JSON.parse(localStorage.getItem(k))||d}catch(e){return d}}
   function save(){localStorage.setItem(TKEY,JSON.stringify(tasks));localStorage.setItem(DKEY,JSON.stringify(diary));localStorage.setItem(GKEY,JSON.stringify(goals));scheduleAutoSave();}
@@ -182,6 +199,52 @@
   function dom(id){for(var i=0;i<DOMAINS.length;i++)if(DOMAINS[i].id===id)return DOMAINS[i];return DOMAINS[0];}
   function esc(s){return(s||"").replace(/[&<>"]/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c];});}
   function rangeDays(){return range==="1m"?30:range==="3m"?90:365;}
+
+  // ── 頻度・完了ヘルパー ──
+  var WD=["\u65e5","\u6708","\u706b","\u6c34","\u6728","\u91d1","\u571f"]; // 0=日
+  function taskFreq(t){return t.freq||{type:"daily",times:3,days:[]};}
+  function weekStartISO(iso){var d=new Date(iso||today());d.setDate(d.getDate()-d.getDay());return d.toISOString().slice(0,10);}
+  function doneOn(t,date){return (t.done||[]).indexOf(date)>=0;}
+  // その日にタスクが「対象」か（期間内＋頻度一致）
+  function isDue(t,date){
+    date=date||today();
+    if(date<t.start||date>t.end)return false;
+    var f=taskFreq(t);
+    if(f.type==="daily")return true;
+    if(f.type==="weekly")return true;   // 週N回は曜日自由、毎日「候補」に出す
+    if(f.type==="days"){var wd=new Date(date).getDay();return (f.days||[]).indexOf(wd)>=0;}
+    return true;
+  }
+  // 週N回タスクの今週の達成数
+  function weeklyDoneCount(t,date){
+    var ws=weekStartISO(date);var we=addDays(ws,6);
+    return (t.done||[]).filter(function(d){return d>=ws&&d<=we;}).length;
+  }
+  // その日に「まだやるべき」か（週N回は達成済みなら出さない）
+  function isTodo(t,date){
+    date=date||today();
+    if(!isDue(t,date))return false;
+    if(doneOn(t,date))return true; // 完了済みも表示（チェック状態で）
+    var f=taskFreq(t);
+    if(f.type==="weekly"){ return weeklyDoneCount(t,date) < (f.times||1); }
+    return true;
+  }
+  function freqLabel(t){
+    var f=taskFreq(t);
+    if(f.type==="daily")return "\u6bce\u65e5";
+    if(f.type==="weekly")return "\u9031"+(f.times||1)+"\u56de";
+    if(f.type==="days"){var ds=(f.days||[]).slice().sort();return ds.map(function(w){return WD[w];}).join("\u30fb")||"\u66dc\u65e5\u672a\u8a2d\u5b9a";}
+    return "";
+  }
+  function toggleDone(id,date){
+    date=date||today();
+    var t=tasks.filter(function(x){return x.id===id;})[0];if(!t)return;
+    if(!t.done)t.done=[];
+    var i=t.done.indexOf(date);
+    if(i>=0)t.done.splice(i,1);else t.done.push(date);
+    save();render();
+  }
+
   function diaryStreak(){
     if(!diary.length)return 0;
     var seen={},ds=[];diary.forEach(function(e){if(!seen[e.date]){seen[e.date]=1;ds.push(e.date);}});
@@ -220,9 +283,34 @@
         '<div class="stat-row">'+
           '<div><div class="stat-num" style="color:var(--accent)">'+activeTasks+'</div><div class="stat-lbl">\u9032\u884c\u4e2d\u306e\u9805\u76ee</div></div>'+
           '<div><div class="stat-num" style="color:var(--green)">'+totalDiary+'</div><div class="stat-lbl">\u65e5\u8a18\u306e\u6570</div></div></div></div>'+
+      todayCard()+
       '<div class="card"><div class="label">\u3053\u308c\u304b\u3089\u53d6\u308a\u7d44\u3080\u3053\u3068</div>'+upHtml+'</div>'+
       '<div class="card"><div class="label">\u9818\u57df\u30d0\u30e9\u30f3\u30b9\uff08\u9032\u884c\u4e2d\uff09</div>'+bal+'</div>'+
       '<div class="card"><div class="label">\u2601\uFE0F \u30af\u30e9\u30a6\u30c9\u540c\u671f</div><div id="syncBox">'+syncInner()+'</div></div>';
+  }
+
+  // 今日取り組むことカード（完了チェック付き）
+  function todayCard(){
+    var td=today();
+    var todos=tasks.filter(function(t){return isTodo(t,td);});
+    // 完了を下に、未完了を上にソート
+    todos.sort(function(a,b){var ad=doneOn(a,td)?1:0,bd=doneOn(b,td)?1:0;return ad-bd;});
+    var doneN=todos.filter(function(t){return doneOn(t,td);}).length;
+    var inner;
+    if(!todos.length){
+      inner='<div class="empty" style="padding:18px 8px">\u4eca\u65e5\u5bfe\u8c61\u306e\u9805\u76ee\u306f\u3042\u308a\u307e\u305b\u3093\u3002<br>\u8a08\u753b\u30bf\u30d6\u3067\u9805\u76ee\u306b\u983b\u5ea6\u3092\u8a2d\u5b9a\u3057\u307e\u3057\u3087\u3046\u3002</div>';
+    }else{
+      inner=todos.map(function(t){var d=dom(t.domain);var done=doneOn(t,td);
+        var sub=freqLabel(t);
+        if(taskFreq(t).type==="weekly")sub+=" \u00b7 \u4eca\u9031"+weeklyDoneCount(t,td)+"/"+(taskFreq(t).times||1);
+        return'<div class="todo-row'+(done?" done":"")+'">'+
+          '<button class="todo-check'+(done?" on":"")+'" data-done="'+t.id+'" style="--c:'+d.color+'">'+(done?"\u2713":"")+'</button>'+
+          '<div class="todo-main"><div class="todo-title">'+esc(t.title)+'</div>'+
+            '<div class="todo-sub"><span style="color:'+d.color+'">'+d.emoji+' '+d.label+'</span> \u00b7 '+sub+'</div></div>'+
+          '</div>';}).join("");
+    }
+    var head='\uD83D\uDCCD \u4eca\u65e5\u53d6\u308a\u7d44\u3080\u3053\u3068'+(todos.length?' \uFF08'+doneN+'/'+todos.length+'\uFF09':'');
+    return '<div class="card"><div class="label">'+head+'</div>'+inner+'</div>';
   }
 
   function plan(){
@@ -319,6 +407,24 @@
         (todayDone?'<div style="font-size:11px;color:var(--muted);margin-top:6px">\u4eca\u65e5\u306f\u3082\u3046\u66f8\u304d\u307e\u3057\u305f \u2713</div>':"")+'</div>'+list;
   }
 
+  function freqEditor(){
+    var f=taskFreq(tform);
+    var seg=[["daily","\u6bce\u65e5"],["weekly","\u9031N\u56de"],["days","\u66dc\u65e5\u6307\u5b9a"]].map(function(x){
+      return'<button class="freq-seg'+(f.type===x[0]?" on":"")+'" data-ftype="'+x[0]+'">'+x[1]+'</button>';}).join("");
+    var detail="";
+    if(f.type==="weekly"){
+      detail='<div style="display:flex;align-items:center;gap:8px;margin-top:9px">'+
+        '<span style="font-size:12px;color:var(--muted)">\u9031</span>'+
+        [1,2,3,4,5,6,7].map(function(n){return'<button class="freq-num'+((f.times||3)===n?" on":"")+'" data-ftimes="'+n+'">'+n+'</button>';}).join("")+
+        '<span style="font-size:12px;color:var(--muted)">\u56de</span></div>';
+    }else if(f.type==="days"){
+      detail='<div style="display:flex;gap:6px;margin-top:9px;justify-content:space-between">'+
+        WD.map(function(w,i){return'<button class="freq-wd'+((f.days||[]).indexOf(i)>=0?" on":"")+'" data-fwd="'+i+'">'+w+'</button>';}).join("")+'</div>';
+    }
+    return '<div style="margin-bottom:16px"><div class="label">\u5b9f\u65bd\u983b\u5ea6</div>'+
+      '<div class="freq-segwrap">'+seg+'</div>'+detail+'</div>';
+  }
+
   function taskSheet(){
     var editing=!!tform.id;
     return '<div class="modal" id="modal"><div class="sheet">'+
@@ -327,6 +433,7 @@
         DOMAINS.map(function(d){return'<button class="dom-pick" data-dom="'+d.id+'" style="'+(tform.domain===d.id?'border-color:'+d.color+';background:'+d.color+'22':'')+'">'+d.emoji+'<span class="nm">'+d.label+'</span></button>';}).join("")+'</div></div>'+
       '<div style="margin-bottom:12px"><div class="label">\u53d6\u308a\u7d44\u307f\u9805\u76ee</div><input id="ttitle" class="input" placeholder="\u4f8b: \u7d71\u8a08\u691c\u5b9a\u306e\u52c9\u5f37" value="'+esc(tform.title)+'"></div>'+
       '<div style="margin-bottom:12px"><div class="label">\u8aac\u660e\uff08\u4efb\u610f\uff09</div><textarea id="tdesc" class="input" placeholder="\u3053\u306e\u9805\u76ee\u306e\u30e1\u30e2\u3084\u76ee\u7684\u306a\u3069" style="min-height:64px">'+esc(tform.desc||"")+'</textarea></div>'+
+      freqEditor()+
       '<div style="display:flex;gap:10px;margin-bottom:20px">'+
         '<div style="flex:1"><div class="label">\u958b\u59cb</div><input id="tstart" type="date" class="input" value="'+tform.start+'"></div>'+
         '<div style="flex:1"><div class="label">\u7d42\u4e86</div><input id="tend" type="date" class="input" value="'+tform.end+'"></div></div>'+
@@ -558,7 +665,9 @@
         localStorage.setItem(TKEY,JSON.stringify(tasks));
         localStorage.setItem(DKEY,JSON.stringify(diary));
         localStorage.setItem(GKEY,JSON.stringify(goals));
-        setSync("ok",silent?"\u30af\u30e9\u30a6\u30c9\u3068\u540c\u671f\u6e08\u307f":"\u8aad\u307f\u8fbc\u307f\u307e\u3057\u305f");
+        var info="";
+        try{ if(data.savedAt){var sd=new Date(data.savedAt);info=" \u00b7 \u30af\u30e9\u30a6\u30c9\u4fdd\u5b58 "+(sd.getMonth()+1)+"/"+sd.getDate()+" "+sd.getHours()+":"+("0"+sd.getMinutes()).slice(-2);} }catch(e){}
+        setSync("ok",(silent?"\u30af\u30e9\u30a6\u30c9\u3068\u540c\u671f\u6e08\u307f":"\u8aad\u307f\u8fbc\u307f\u307e\u3057\u305f \u00b7 \u65e5\u8a18"+diary.length+"\u4ef6")+info);
         render();
       }).catch(function(){ if(!silent)setSync("error","\u8aad\u307f\u8fbc\u307f\u306b\u5931\u6557\u3057\u307e\u3057\u305f"); });
     }, !silent);
@@ -641,12 +750,13 @@
 
   function bind(){
     bindSync();
+    document.querySelectorAll("[data-done]").forEach(function(b){b.onclick=function(){toggleDone(+b.dataset.done);};});
     var tb=document.querySelectorAll("[data-tab]");tb.forEach(function(b){b.onclick=function(){tab=b.dataset.tab;showSheet=null;render();};});
     document.querySelectorAll("[data-range]").forEach(function(b){b.onclick=function(){range=b.dataset.range;render();};});
     var fab=document.getElementById("fab");
     if(fab)fab.onclick=function(){if(tab==="plan"){tform=blankTask();showSheet="task";}else if(tab==="diary"){dform=blankDiary();compareDate=null;coachState={loading:false,result:null,error:null};showSheet="diary";}render();};
     document.querySelectorAll("[data-task]").forEach(function(b){b.onclick=function(){
-      var t=tasks.filter(function(x){return x.id==b.dataset.task;})[0];if(t){tform=JSON.parse(JSON.stringify(t));showSheet="task";render();}};});
+      var t=tasks.filter(function(x){return x.id==b.dataset.task;})[0];if(t){tform=JSON.parse(JSON.stringify(t));if(!tform.freq)tform.freq={type:"daily",times:3,days:[]};if(!tform.done)tform.done=[];showSheet="task";render();}};});
     document.querySelectorAll("[data-diary]").forEach(function(b){b.onclick=function(){
       var e=diary.filter(function(x){return x.id==b.dataset.diary;})[0];if(e){dform=JSON.parse(JSON.stringify(e));if(!dform.taskIds)dform.taskIds=[];if(!dform.coachLog)dform.coachLog=[];compareDate=null;coachState={loading:false,result:null,error:null};showSheet="diary";render();}};});
 
@@ -656,6 +766,12 @@
       document.querySelectorAll("[data-dom]").forEach(function(b){b.onclick=function(){tform.domain=b.dataset.dom;render();};});
       var tt=document.getElementById("ttitle");if(tt)tt.oninput=function(){tform.title=tt.value;};
       var td=document.getElementById("tdesc");if(td)td.oninput=function(){tform.desc=td.value;};
+      if(!tform.freq)tform.freq={type:"daily",times:3,days:[]};
+      document.querySelectorAll("[data-ftype]").forEach(function(b){b.onclick=function(){tform.freq.type=b.dataset.ftype;render();};});
+      document.querySelectorAll("[data-ftimes]").forEach(function(b){b.onclick=function(){tform.freq.times=+b.dataset.ftimes;render();};});
+      document.querySelectorAll("[data-fwd]").forEach(function(b){b.onclick=function(){
+        var w=+b.dataset.fwd;if(!tform.freq.days)tform.freq.days=[];
+        var i=tform.freq.days.indexOf(w);if(i>=0)tform.freq.days.splice(i,1);else tform.freq.days.push(w);render();};});
       var ts=document.getElementById("tstart");if(ts)ts.onchange=function(){tform.start=ts.value;};
       var te=document.getElementById("tend");if(te)te.onchange=function(){tform.end=te.value;};
       var sT=document.getElementById("saveTask");
