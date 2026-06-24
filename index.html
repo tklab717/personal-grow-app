@@ -157,9 +157,256 @@
   .sync-toggle.on .knob{left:23px;}
 </style>
 <script src="https://accounts.google.com/gsi/client" async defer></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
 </head>
 <body>
 <div id="app"></div>
+<script>
+/* =====================================================================
+ * recall-store.js  v2  —  GROW 想起カード台帳レイヤー（同期対応・差し込み式）
+ * ---------------------------------------------------------------------
+ * v2の肝（「きっちり」版）:
+ *   進捗を「状態」でなく「想起イベントのログ」で持つ。
+ *     event = { id:"端末:連番", at: ISO時刻, grade: 2..5 }
+ *   ・マージ = イベント集合の和（union）。可換・冪等・結合的、後退しない。
+ *   ・活動量の合計（のべ想起回数）= イベント数の和 → 別端末ぶんも正しく増える。
+ *   ・スケジュール(reps/間隔/次回) = ログを時刻順に再生して導出。
+ *       同じ日の複数回は1段に畳む（はしごを上げ過ぎない）。
+ *       次回出題日は「その想起を行った日」を基準に計算（後追い同期でもズレない）。
+ *   コンテンツ（問い・答え）は contentAt の新しい方（作り直せる側）。
+ *   削除は tombstone。削除より後の想起があれば復活。
+ *   id は再計算しない。スキルが付けた id をそのままキーに使う。
+ *
+ * 保存2層: local（端末・常時） + remote（Drive 等・sync時）。アダプタで差し込む。
+ * ===================================================================== */
+(function (root, factory) {
+  if (typeof module === 'object' && module.exports) module.exports = factory();
+  else root.RecallStoreLib = factory();
+}(typeof self !== 'undefined' ? self : this, function () {
+  'use strict';
+
+  /* ---------- 時刻・日付 ---------- */
+  const nowISO = () => new Date().toISOString();
+  const today = () => new Date().toISOString().slice(0, 10);
+  const dayOf = iso => String(iso).slice(0, 10);
+  const addDays = (d, n) => { const x = new Date(d + 'T00:00:00'); x.setDate(x.getDate() + n); return x.toISOString().slice(0, 10); };
+  const ts = s => (s ? Date.parse(s) : 0);
+  const emptyStore = () => ({ format: 'grow-recall-store', version: 2, cards: {} });
+  const clone = o => JSON.parse(JSON.stringify(o));
+
+  /* ---------- 契約（スキル出力）の検証 ---------- */
+  const TYPES = new Set(['free_recall', 'cued', 'cloze']);
+  const FORBIDDEN = ['due', 'next', 'nextDue', 'interval', 'ease', 'ef', 'reps', 'lapses', 'stability', 'difficulty', 'srs', 'schedule', 'history', 'events'];
+  function validateImport(obj) {
+    const e = [];
+    if (!obj || typeof obj !== 'object') return ['JSONオブジェクトではありません'];
+    if (obj.format !== 'grow-recall-cards') e.push('format が "grow-recall-cards" ではありません');
+    if (obj.version !== 1) e.push('version が 1 ではありません');
+    if (!obj.source || typeof obj.source !== 'string') e.push('source（出典）が空です');
+    if (!Array.isArray(obj.cards) || obj.cards.length === 0) { e.push('cards が空です'); return e; }
+    obj.cards.forEach((c, i) => {
+      const t = '#' + (i + 1) + ': ';
+      if (!/^[0-9a-f]{8}$/.test(c.id || '')) e.push(t + 'id が8桁16進ではありません');
+      if (!TYPES.has(c.type)) e.push(t + 'type が不正');
+      if (!Array.isArray(c.tags) || c.tags.filter(x => String(x).trim()).length === 0) e.push(t + 'tags が空');
+      if (!c.prompt || !String(c.prompt).trim()) e.push(t + 'prompt が空');
+      if (!c.answer || !String(c.answer).trim()) e.push(t + 'answer が空');
+      const bad = FORBIDDEN.filter(k => k in c);
+      if (bad.length) e.push(t + '禁止フィールド: ' + bad.join(','));
+    });
+    return e;
+  }
+
+  /* ---------- SM-2 を1段進める（純粋） ---------- */
+  function sm2step(s, q, dayISO) {           // q: 2=もう一度 3=難 4=普通 5=易
+    if (q < 3) { s.reps = 0; s.intervalDays = 1; s.lapses++; }
+    else {
+      if (s.reps === 0) s.intervalDays = 1;
+      else if (s.reps === 1) s.intervalDays = 6;
+      else s.intervalDays = Math.round(s.intervalDays * s.ef);
+      s.reps++;
+    }
+    s.ef = Math.max(1.3, s.ef + (0.1 - (5 - q) * (0.08 + (5 - q) * 0.02)));
+    s.due = addDays(dayISO, s.intervalDays);
+    s.lastGrade = q;
+  }
+
+  /* ---------- イベントログ → スケジュール導出（純粋） ---------- */
+  // 時刻順に並べ、同じ日は最後の評価1回に畳んで SM-2 を再生する。
+  function deriveSrs(events) {
+    const base = { reps: 0, lapses: 0, ef: 2.5, intervalDays: 0, due: today(), reviewedAt: null, lastGrade: null };
+    if (!events || !events.length) return base;
+    const sorted = events.slice().sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : (a.id < b.id ? -1 : 1)));
+    const lastPerDay = []; let curDay = null;
+    for (const ev of sorted) {
+      const d = dayOf(ev.at);
+      if (d === curDay) lastPerDay[lastPerDay.length - 1] = ev;
+      else { lastPerDay.push(ev); curDay = d; }
+    }
+    for (const ev of lastPerDay) sm2step(base, ev.grade, dayOf(ev.at));
+    base.reviewedAt = sorted[sorted.length - 1].at;
+    return base;
+  }
+
+  /* ---------- カードの正規化 ---------- */
+  function normalize(c) {
+    if (!c) return c;
+    if (c.deletedAt && !c.events) return { id: c.id, deletedAt: c.deletedAt };
+    c.events = Array.isArray(c.events) ? c.events : [];
+    c.srs = deriveSrs(c.events);
+    return c;
+  }
+  const contentOf = c => ({ id: c.id, type: c.type, tags: c.tags, prompt: c.prompt, answer: c.answer, hint: c.hint || '', note: c.note || '', source: c.source || '', contentAt: c.contentAt || null });
+  const stableKey = c => JSON.stringify([c.answer, c.prompt, c.contentAt]);
+
+  /* ---------- マージの心臓部 ---------- */
+  function unionEvents(ea, eb) {
+    const m = new Map();
+    (ea || []).forEach(e => m.set(e.id, e));
+    (eb || []).forEach(e => m.set(e.id, e));   // 同一 id は1つ（冪等・二重計上なし）
+    return [...m.values()];
+  }
+  function mergeCard(a, b) {
+    if (!a) return normalize(clone(b));
+    if (!b) return normalize(clone(a));
+    const ca = ts(a.contentAt), cb = ts(b.contentAt);
+    let content = cb > ca ? contentOf(b) : ca > cb ? contentOf(a) : (stableKey(b) > stableKey(a) ? contentOf(b) : contentOf(a));
+    const events = unionEvents(a.events, b.events);
+    const srs = deriveSrs(events);
+    const aliveStamp = Math.max(ts(content.contentAt), srs.reviewedAt ? ts(srs.reviewedAt) : 0);
+    const delStamp = Math.max(ts(a.deletedAt), ts(b.deletedAt));
+    if (delStamp > 0 && delStamp >= aliveStamp) return { id: content.id, deletedAt: new Date(delStamp).toISOString() };
+    return Object.assign(content, { deletedAt: null, events, srs });
+  }
+  function mergeStores(A, B) {
+    const a = (A && A.cards) || {}, b = (B && B.cards) || {};
+    const out = emptyStore();
+    new Set([...Object.keys(a), ...Object.keys(b)]).forEach(id => { out.cards[id] = mergeCard(a[id], b[id]); });
+    return out;
+  }
+
+  /* ---------- アダプタ（差し込み式 I/O） ---------- */
+  class MemoryAdapter {
+    constructor(initial) { this._s = initial ? clone(initial) : null; }
+    async load() { return this._s ? clone(this._s) : null; }
+    async save(s) { this._s = clone(s); }
+  }
+  class LocalStorageAdapter {
+    constructor(key) { this.key = key; }
+    async load() { try { const r = localStorage.getItem(this.key); return r ? JSON.parse(r) : null; } catch (e) { return null; } }
+    async save(s) { localStorage.setItem(this.key, JSON.stringify(s)); }
+  }
+  class DriveAppDataAdapter {
+    constructor({ getToken, filename = 'grow_recall_cards.json' }) { this.getToken = getToken; this.filename = filename; this._fileId = null; }
+    async _headers() { return { Authorization: 'Bearer ' + (await this.getToken()) }; }
+    async _find() {
+      if (this._fileId) return this._fileId;
+      const q = encodeURIComponent(`name='${this.filename}'`);
+      const r = await fetch(`https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=${q}&fields=files(id,name)`, { headers: await this._headers() });
+      if (!r.ok) throw new Error('Drive list失敗: ' + r.status);
+      const j = await r.json(); this._fileId = (j.files && j.files[0] && j.files[0].id) || null; return this._fileId;
+    }
+    async load() {
+      const id = await this._find(); if (!id) return null;
+      const r = await fetch(`https://www.googleapis.com/drive/v3/files/${id}?alt=media`, { headers: await this._headers() });
+      if (!r.ok) throw new Error('Drive get失敗: ' + r.status); return await r.json();
+    }
+    async save(store) {
+      const id = await this._find();
+      const meta = { name: this.filename, parents: id ? undefined : ['appDataFolder'] };
+      const boundary = 'grow' + Math.random().toString(36).slice(2);
+      const body = `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(meta)}\r\n` +
+        `--${boundary}\r\nContent-Type: application/json\r\n\r\n${JSON.stringify(store)}\r\n--${boundary}--`;
+      const url = id ? `https://www.googleapis.com/upload/drive/v3/files/${id}?uploadType=multipart`
+                     : `https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart`;
+      const r = await fetch(url, { method: id ? 'PATCH' : 'POST', headers: Object.assign(await this._headers(), { 'Content-Type': `multipart/related; boundary=${boundary}` }), body });
+      if (!r.ok) throw new Error('Drive save失敗: ' + r.status);
+      const j = await r.json(); if (j.id) this._fileId = j.id;
+    }
+  }
+
+  /* ---------- 台帳本体 ---------- */
+  function rid() { return Math.random().toString(36).slice(2, 8); }
+  class RecallStore {
+    constructor({ local, remote, deviceId } = {}) {
+      this.local = local || new MemoryAdapter();
+      this.remote = remote || null;
+      this.deviceId = deviceId || null;
+      this.data = emptyStore();
+      this.seq = 0;
+    }
+    async init() {
+      const s = await this.local.load();
+      if (s && s.cards) { this.data = { format: 'grow-recall-store', version: 2, cards: s.cards }; this.seq = s.seq || 0; this.deviceId = this.deviceId || s.deviceId || null; }
+      this.deviceId = this.deviceId || ('dev-' + rid());
+      Object.values(this.data.cards).forEach(normalize);
+      return this;
+    }
+    _localBlob() { return { format: 'grow-recall-store', version: 2, deviceId: this.deviceId, seq: this.seq, cards: this.data.cards }; }
+    async _persist() { await this.local.save(this._localBlob()); }
+
+    /* 取り込み（マージ）: スキル契約JSON → 台帳。進捗(events)は保持。 */
+    import(contractJson) {
+      const errs = validateImport(contractJson);
+      if (errs.length) return { ok: false, errors: errs };
+      const incoming = emptyStore(); const stamp = nowISO();
+      contractJson.cards.forEach(c => {
+        incoming.cards[c.id] = { id: c.id, type: c.type, tags: c.tags.slice(), prompt: c.prompt, answer: c.answer, hint: c.hint || '', note: c.note || '', source: contractJson.source, contentAt: stamp, deletedAt: null, events: [] };
+      });
+      let nNew = 0, nUpd = 0;
+      Object.keys(incoming.cards).forEach(id => { this.data.cards[id] && !this.data.cards[id].deletedAt ? nUpd++ : nNew++; });
+      this.data = mergeStores(this.data, incoming);
+      this._persist();
+      return { ok: true, added: nNew, updated: nUpd, total: this.count() };
+    }
+
+    /* 参照系 */
+    live() { return Object.values(this.data.cards).filter(c => !c.deletedAt); }
+    count() { return this.live().length; }
+    get(id) { const c = this.data.cards[id]; return c && !c.deletedAt ? c : null; }
+    dueToday() { return this.live().filter(c => c.srs.due <= today()).sort((a, b) => a.srs.due < b.srs.due ? -1 : 1); }
+    coverage() { const m = {}; this.live().forEach(c => c.tags.forEach(t => { m[t] = (m[t] || 0) + 1; })); return m; }
+    matured(days = 21) { return this.live().filter(c => c.srs.intervalDays >= days).length; }
+    totalReviews() { return this.live().reduce((n, c) => n + (c.events ? c.events.length : 0), 0); }
+    reviewsOf(id) { const c = this.get(id); return c && c.events ? c.events.length : 0; }
+    activityByDevice() { const m = {}; this.live().forEach(c => (c.events || []).forEach(e => { const d = e.id.split(':')[0]; m[d] = (m[d] || 0) + 1; })); return m; }
+
+    /* 採点: イベントを1件追記し、スケジュールを再導出 */
+    review(id, q) {
+      const c = this.data.cards[id];
+      if (!c || c.deletedAt) return null;
+      c.events = c.events || [];
+      this.seq += 1;
+      c.events.push({ id: this.deviceId + ':' + this.seq, at: nowISO(), grade: q });
+      c.srs = deriveSrs(c.events);
+      this._persist();
+      return c.srs;
+    }
+
+    /* 削除（tombstone） */
+    delete(id) { const c = this.data.cards[id]; if (!c) return false; this.data.cards[id] = { id, deletedAt: nowISO() }; this._persist(); return true; }
+
+    /* 同期: remote を引き、カード単位でマージし、両方へ書き戻す */
+    async sync() {
+      if (!this.remote) throw new Error('remote アダプタが未設定です');
+      const remote = (await this.remote.load()) || emptyStore();
+      this.data = mergeStores(this.data, remote);
+      await this.remote.save({ format: 'grow-recall-store', version: 2, cards: this.data.cards });
+      await this._persist();
+      return { ok: true, total: this.count(), totalReviews: this.totalReviews() };
+    }
+  }
+
+  return {
+    RecallStore, mergeStores, mergeCard, deriveSrs, sm2step, validateImport,
+    MemoryAdapter, LocalStorageAdapter, DriveAppDataAdapter,
+    _util: { today, addDays, nowISO, dayOf, emptyStore }
+  };
+}));
+
+</script>
 <script>
 (function(){
   var DOMAINS=[
@@ -185,6 +432,24 @@
 
   var tasks=load(TKEY,[]),diary=load(DKEY,[]),goals=load(GKEY,[]);
   var tab="home",range="1m",showSheet=null;
+
+  /* ---- GROW Recall: ストア初期化 ---- */
+  var RL = window.RecallStoreLib;
+  var recallDriveAdapter = new RL.DriveAppDataAdapter({
+    filename: 'grow_recall_cards.json',
+    getToken: function(){ return new Promise(function(resolve, reject){
+      gAuth(function(){ resolve(gToken); }, false);
+      setTimeout(function(){ if(!gToken) reject(new Error('token timeout')); }, 9000);
+    }); }
+  });
+  var recallStore = new RL.RecallStore({
+    local: { load: async function(){ try{ var r=localStorage.getItem('grow_recall_cards'); return r?JSON.parse(r):null; }catch(e){ return null; } },
+             save: async function(s){ try{ localStorage.setItem('grow_recall_cards',JSON.stringify(s)); }catch(e){} } },
+    remote: recallDriveAdapter,
+    deviceId: 'grow-' + (localStorage.getItem('grow_recall_device') || (function(){ var id=Math.random().toString(36).slice(2,8); localStorage.setItem('grow_recall_device',id); return id; })())
+  });
+  recallStore.init();
+  var rcTab='review', rcParsed=null, rcQueue=[], rcCur=null;
   var tform=blankTask(),dform=blankDiary(),compareDate=null;
 
   function blankTask(){return{id:null,domain:"work",title:"",desc:"",start:today(),end:addDays(today(),14),goalId:"",freq:{type:"daily",times:3,days:[]},done:[]};}
@@ -733,16 +998,250 @@
     var t=document.getElementById("syncToggle");if(t)t.onclick=toggleAutoSync;
   }
 
+
+  /* ================================================================
+   * GROW Recall ビュー
+   * ================================================================ */
+  function km(el){ if(window.renderMathInElement) renderMathInElement(el,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false}); }
+  function rcEsc(s){ return String(s).replace(/[&<>]/g,function(m){return({'&':'&amp;','<':'&lt;','>':'&gt;'}[m]);}); }
+
+  function recallView(){
+    var rs = recallStore;
+    var stats =
+      '<div style="display:flex;gap:7px;margin-bottom:10px;">' +
+        rcStat(rs.count(),'カード','#1c2433') +
+        rcStat(rs.dueToday().length,'今日','#e25141') +
+        rcStat(rs.totalReviews(),'のべ','#2e8b57') +
+        rcStat(rs.matured(),'定着','#3a6ea8') +
+      '</div>';
+    var subTabs =
+      '<div style="display:flex;background:#e7edf4;border-radius:11px;padding:3px;margin-bottom:10px;">' +
+        ['review','import','ledger'].map(function(n){
+          var labels={review:'想起',import:'取り込み',ledger:'台帳'};
+          return '<button onclick="rcSetTab(\''+n+'\')" style="flex:1;border:none;padding:9px 4px;font-size:13px;font-weight:700;border-radius:9px;background:'+(rcTab===n?'#fff':'transparent')+';color:'+(rcTab===n?'#1c2433':'#5a6678')+';box-shadow:'+(rcTab===n?'0 1px 3px rgba(0,0,0,.1)':'none')+';">'+labels[n]+'</button>';
+        }).join('') +
+      '</div>';
+    var body = rcTab==='review' ? rcReviewPane(rs) : rcTab==='import' ? rcImportPane(rs) : rcLedgerPane(rs);
+    return '<div style="padding:4px 0 60px;">' + stats + subTabs + body + '</div>';
+  }
+  function rcStat(v,l,c){ return '<div style="flex:1;text-align:center;background:#fff;border:1px solid #dce3ec;border-radius:11px;padding:9px 3px;"><div style="font-size:21px;font-weight:800;color:'+c+';font-family:serif;line-height:1;">'+v+'</div><div style="font-size:10px;color:#5a6678;margin-top:4px;">'+l+'</div></div>'; }
+
+  function rcReviewPane(rs){
+    var q = rs.dueToday();
+    if(!q.length){
+      return '<div style="background:#fff;border:1px solid #dce3ec;border-radius:14px;padding:20px;text-align:center;color:#5a6678;line-height:1.8;font-size:13px;">' +
+        (rs.count() ? '今日の想起は完了です 🎉<br><span style="font-size:12px;">次回出題日まで休みましょう</span>' : 'まだカードがありません。<br>「取り込み」からカードを追加してください。') +
+        '</div>';
+    }
+    rcCur = q[0];
+    var revealed = !!document.getElementById('rcAns');
+    return '<div style="background:#fff;border:1px solid #dce3ec;border-radius:14px;padding:15px;" id="rcCard">' +
+      '<div style="font-size:10.5px;font-weight:700;background:#fbf3e0;color:#c08a2d;padding:1px 8px;border-radius:99px;display:inline-block;margin-bottom:8px;">'+rcEsc(rcCur.type)+'</div>' +
+      '<div id="rcQ" style="font-size:16px;font-weight:700;line-height:1.7;margin-bottom:12px;">'+rcEsc(rcCur.prompt)+'</div>' +
+      '<div style="display:flex;gap:7px;">' +
+        '<button onclick="rcReveal()" id="rcRevBtn" style="border:none;border-radius:9px;padding:10px 14px;font-size:13px;font-weight:700;background:#3a6ea8;color:#fff;">答えを表示</button>' +
+        '<span style="font-size:11.5px;color:#9aa6b6;margin-top:auto;padding-bottom:2px;">残り'+q.length+'問</span>' +
+      '</div>' +
+      '<div id="rcAns" style="display:none;border-top:1px dashed #dce3ec;margin-top:12px;padding-top:12px;font-size:14.5px;line-height:1.85;"></div>' +
+      '<div id="rcGrades" style="display:none;gap:6px;margin-top:14px;"></div>' +
+    '</div>';
+  }
+
+  function rcImportPane(){
+    var prev = rcParsed ? (
+      '<div style="margin-top:9px;">' +
+        '<div style="display:flex;gap:8px;margin-bottom:8px;">' +
+          ['新規','更新','不変'].map(function(l,i){ var v=[rcDiff.n,rcDiff.u,rcDiff.s][i]; var c=['#2e8b57','#3a6ea8','#9aa6b6'][i]; return '<div style="flex:1;text-align:center;border:1px solid #dce3ec;border-radius:9px;padding:7px 3px;background:#fbfcfe;"><div style="font-size:18px;font-weight:800;color:'+c+';font-family:serif;">'+v+'</div><div style="font-size:10px;color:#5a6678;">'+l+'</div></div>'; }).join('') +
+        '</div>' +
+        rcParsed.cards.slice(0,4).map(function(c){ return '<div style="border:1px solid #dce3ec;border-radius:9px;padding:8px 10px;margin:5px 0;background:#fbfcfe;font-size:12.5px;"><span style="display:inline-block;font-size:10px;font-weight:700;padding:1px 7px;border-radius:99px;background:#fbf3e0;color:#c08a2d;margin-right:5px;">'+c.type+'</span>'+rcEsc(c.prompt)+'</div>'; }).join('') +
+        (rcParsed.cards.length>4?'<div style="font-size:11.5px;color:#5a6678;">…他 '+(rcParsed.cards.length-4)+'枚</div>':'') +
+        '<div style="margin-top:9px;display:flex;gap:7px;">' +
+          '<button id="rcMergeBtn" onclick="rcDoMerge()" style="border:none;border-radius:9px;padding:10px 14px;font-size:13px;font-weight:700;background:#c08a2d;color:#fff;">'+(rcDiff&&(rcDiff.n+rcDiff.u)>0?'取り込む（マージ）':'変更なし')+'</button>' +
+        '</div>' +
+      '</div>'
+    ) : '';
+    return '<div style="background:#fff;border:1px solid #dce3ec;border-radius:14px;padding:14px;">' +
+      '<div style="font-size:14px;font-weight:700;margin-bottom:9px;">スキル出力JSONを貼り付け</div>' +
+      '<textarea id="rcTa" style="width:100%;min-height:100px;border:1px solid #dce3ec;border-radius:9px;padding:9px;font-family:ui-monospace,monospace;font-size:12px;line-height:1.6;background:#fbfcfe;resize:vertical;" placeholder="grow-recall-cards のJSONを貼り付け…"></textarea>' +
+      '<div id="rcMsg" style="font-size:12.5px;line-height:1.7;padding:8px 10px;border-radius:8px;margin-top:8px;display:none;"></div>' +
+      '<div style="display:flex;gap:7px;margin-top:8px;flex-wrap:wrap;">' +
+        '<button onclick="rcSample()" style="border:1px solid #dce3ec;border-radius:9px;padding:9px 12px;font-size:12.5px;font-weight:700;background:#fff;color:#5a6678;">サンプル</button>' +
+        '<button onclick="rcValidate()" style="border:none;border-radius:9px;padding:9px 12px;font-size:13px;font-weight:700;background:#3a6ea8;color:#fff;">検証</button>' +
+        '<button onclick="rcClearTa()" style="border:1px solid #dce3ec;border-radius:9px;padding:9px 12px;font-size:12.5px;font-weight:700;background:#fff;color:#5a6678;">クリア</button>' +
+      '</div>' + prev + '</div>';
+  }
+
+  function rcLedgerPane(rs){
+    var cov = rs.coverage(); var ents = Object.entries(cov).sort(function(a,b){return b[1]-a[1];});
+    var chips = ents.length ? ents.map(function(e){ return '<span style="font-size:11px;font-weight:700;padding:3px 9px;border-radius:99px;background:#e9f1fb;color:#3a6ea8;">'+rcEsc(e[0])+'<span style="opacity:.7;margin-left:4px;">'+e[1]+'</span></span>'; }).join(' ') : '<span style="font-size:12px;color:#5a6678;">なし</span>';
+    var cards = rs.live().sort(function(a,b){return a.srs.due<b.srs.due?-1:1;});
+    var rows = cards.map(function(c){
+      return '<div style="display:flex;align-items:center;gap:8px;border:1px solid #dce3ec;border-radius:9px;padding:8px 9px;margin:5px 0;background:#fbfcfe;">' +
+        '<span style="flex:1;font-size:12px;font-weight:600;line-height:1.4;">'+(c.tags||[]).map(function(t){return '<span style="font-size:10px;color:#3a6ea8;font-weight:700;margin-right:4px;">#'+rcEsc(t)+'</span>';}).join('')+'<br>'+rcEsc(c.prompt)+'</span>' +
+        '<span style="font-size:10.5px;color:#5a6678;text-align:right;white-space:nowrap;"><span style="color:#2e8b57;font-weight:700;">のべ'+rs.reviewsOf(c.id)+'</span><br>reps '+c.srs.reps+'<br>次回 '+c.srs.due.slice(5)+'</span>' +
+        '<button onclick="rcDel(\''+c.id+'\')" style="border:none;background:none;color:#e25141;font-size:16px;padding:2px 6px;">×</button>' +
+      '</div>';
+    }).join('');
+    return '<div style="background:#fff;border:1px solid #dce3ec;border-radius:14px;padding:14px;margin-bottom:10px;">' +
+        '<div style="font-size:13px;font-weight:700;margin-bottom:7px;">範囲カバレッジ</div>' + chips + '</div>' +
+      '<div style="background:#fff;border:1px solid #dce3ec;border-radius:14px;padding:14px;margin-bottom:10px;">' +
+        '<div style="font-size:13px;font-weight:700;margin-bottom:7px;">同期（Google Drive）</div>' +
+        '<button onclick="rcSync()" style="border:none;border-radius:9px;padding:10px 14px;font-size:13px;font-weight:700;background:#c08a2d;color:#fff;">クラウドと同期</button>' +
+      '</div>' +
+      '<div style="background:#fff;border:1px solid #dce3ec;border-radius:14px;padding:14px;">' +
+        '<div style="font-size:13px;font-weight:700;margin-bottom:7px;">カード一覧（'+cards.length+'枚）</div>' + rows +
+        '<div style="margin-top:10px;">' +
+          '<button onclick="rcReset()" style="border:1px solid #f0c4be;border-radius:9px;padding:9px 12px;font-size:12.5px;font-weight:700;background:#fff;color:#e25141;">台帳をリセット</button>' +
+        '</div>' +
+      '</div>';
+  }
+
+  /* ---- Recall ハンドラ（onclick から呼ぶ） ---- */
+  var rcDiff={n:0,u:0,s:0};
+  function rcSetTab(t){ rcTab=t; rcParsed=null; render(); }
+  function rcReveal(){
+    var ans=document.getElementById('rcAns'); if(!ans||!rcCur)return;
+    ans.innerHTML=rcEsc(rcCur.answer)+(rcCur.note?'<div style="margin-top:7px;font-size:12.5px;color:#c08a2d;">💡 '+rcEsc(rcCur.note)+'</div>':'');
+    km(ans); ans.style.display='block';
+    var rb=document.getElementById('rcRevBtn'); if(rb)rb.style.display='none';
+    var gr=document.getElementById('rcGrades'); if(gr){
+      gr.style.display='flex'; gr.style.gap='6px';
+      gr.innerHTML=['もう一度','難しい','普通','簡単'].map(function(l,i){
+        var q=[2,3,4,5][i]; var bg=['#fdecea','#fbf3e0','#e9f1fb','#e8f4ec'][i]; var col=['#e25141','#c08a2d','#3a6ea8','#2e8b57'][i];
+        return '<button onclick="rcGrade('+q+')" style="flex:1;border:none;border-radius:9px;padding:11px 3px;font-size:12px;font-weight:700;background:'+bg+';color:'+col+';">'+l+'</button>';
+      }).join('');
+    }
+  }
+  function rcGrade(q){
+    if(!rcCur)return;
+    recallStore.review(rcCur.id,q);
+    var intv=recallStore.get(rcCur.id).srs.intervalDays;
+    rcShowToast(q<3?'もう一度（明日）':'次回 '+intv+'日後');
+    render();
+  }
+  function rcValidate(){
+    rcParsed=null;
+    var ta=document.getElementById('rcTa'); if(!ta)return;
+    var obj; try{ obj=JSON.parse(ta.value); }catch(e){ rcMsgShow('err','JSON構文エラー: '+e.message); return; }
+    var errs=RL.validateImport(obj);
+    if(errs.length){ rcMsgShow('err','検証エラー（'+errs.length+'件）: '+errs.join(' / ')); return; }
+    rcParsed=obj;
+    var n=0,u=0,s=0;
+    obj.cards.forEach(function(c){ var ex=recallStore.get(c.id); if(!ex)n++; else (ex.answer!==c.answer||ex.prompt!==c.prompt)?u++:s++; });
+    rcDiff={n:n,u:u,s:s};
+    rcMsgShow('ok','✓ 契約に適合（'+obj.cards.length+'枚 / 出典: '+rcEsc(obj.source)+'）');
+    render();
+  }
+  function rcDoMerge(){
+    if(!rcParsed)return;
+    var r=recallStore.import(rcParsed);
+    if(!r.ok){ rcShowToast('取り込み失敗'); return; }
+    rcShowToast('✓ 新規'+r.added+' / 更新'+r.updated);
+    rcParsed=null; rcTab='review'; render();
+  }
+  function rcSample(){
+    var ta=document.getElementById('rcTa'); if(!ta)return;
+    ta.value=JSON.stringify({format:"grow-recall-cards",version:1,source:"統計検定準1級 サンプル 問1",created:today(),cards:[
+      {id:"cc65a88f",type:"free_recall",tags:["検定","t分布"],prompt:"母分散が未知のとき、zでなくtを使う理由を説明せよ",answer:"標本から $s$ を推定する分ばらつきが大きく、裾の重い $t$ 分布（自由度 $n-1$）に従うため。",note:"自由度→∞でtはzに一致"},
+      {id:"74b1a515",type:"cloze",tags:["t分布"],prompt:"自由度 $\\nu\\to\\infty$ で t分布が一致する分布は？",answer:"標準正規分布"},
+      {id:"5a7357b4",type:"cued",tags:["適用条件"],prompt:"対応のある2群の平均差。前提が満たされるとき使う検定は？",answer:"対応のある t 検定（差の母平均 $=0$ を検定）"}
+    ]},null,2);
+    rcParsed=null;
+  }
+  function rcClearTa(){ var ta=document.getElementById('rcTa'); if(ta)ta.value=''; rcParsed=null; }
+  function rcDel(id){ if(!confirm('このカードを削除しますか？'))return; recallStore.delete(id); render(); }
+  async function rcSync(){
+    try{
+      rcShowToast('同期中…');
+      var r=await recallStore.sync();
+      rcShowToast('✓ 同期完了 '+r.total+'枚 / のべ'+r.totalReviews);
+    }catch(e){ rcShowToast('同期エラー: '+e.message); }
+    render();
+  }
+  async function rcReset(){ if(!confirm('台帳の全カードと進捗を削除します。よろしいですか？'))return; recallStore.data=RL._util.emptyStore(); await recallStore._persist(); render(); }
+  function rcMsgShow(type,msg){
+    var el=document.getElementById('rcMsg'); if(!el)return;
+    el.style.display='block'; el.style.background=type==='ok'?'#e8f4ec':'#fdecea'; el.style.color=type==='ok'?'#2e8b57':'#e25141'; el.style.borderLeft='3px solid '+(type==='ok'?'#2e8b57':'#e25141'); el.style.padding='8px 10px'; el.innerHTML=msg;
+  }
+  var rcToastTimer=null;
+  function rcShowToast(msg){
+    var el=document.getElementById('rcToast');
+    if(!el){ el=document.createElement('div'); el.id='rcToast'; el.style.cssText='position:fixed;left:50%;bottom:calc(env(safe-area-inset-bottom)+20px);transform:translateX(-50%) translateY(20px);background:#1c2433;color:#fff;padding:11px 18px;border-radius:99px;font-size:13px;font-weight:700;opacity:0;transition:.3s;z-index:999;box-shadow:0 6px 20px rgba(0,0,0,.2);'; document.body.appendChild(el); }
+    el.textContent=msg; el.style.opacity='1'; el.style.transform='translateX(-50%) translateY(0)';
+    if(rcToastTimer)clearTimeout(rcToastTimer);
+    rcToastTimer=setTimeout(function(){ el.style.opacity='0'; el.style.transform='translateX(-50%) translateY(20px)'; },1800);
+  }
+
+  // recall ハンドラをグローバルに公開（inline onclickから呼べるようにする）
+  window.rcSetTab=function(t){rcTab=t;rcParsed=null;render();};
+  window.rcReveal=function(){
+    var ans=document.getElementById('rcAns'); if(!ans||!rcCur)return;
+    ans.innerHTML=rcEsc(rcCur.answer)+(rcCur.note?'<div style="margin-top:7px;font-size:12.5px;color:#c08a2d;">💡 '+rcEsc(rcCur.note)+'</div>':'');
+    km(ans); ans.style.display='block';
+    var rb=document.getElementById('rcRevBtn'); if(rb)rb.style.display='none';
+    var gr=document.getElementById('rcGrades'); if(gr){
+      gr.style.display='flex'; gr.style.gap='6px';
+      gr.innerHTML=['もう一度','難しい','普通','簡単'].map(function(l,i){
+        var q=[2,3,4,5][i]; var bg=['#fdecea','#fbf3e0','#e9f1fb','#e8f4ec'][i]; var col=['#e25141','#c08a2d','#3a6ea8','#2e8b57'][i];
+        return '<button onclick="rcGrade('+q+')" style="flex:1;border:none;border-radius:9px;padding:11px 3px;font-size:12px;font-weight:700;background:'+bg+';color:'+col+';">'+l+'</button>';
+      }).join('');
+    }
+  };
+  window.rcGrade=function(q){
+    if(!rcCur)return;
+    recallStore.review(rcCur.id,q);
+    var intv=recallStore.get(rcCur.id).srs.intervalDays;
+    rcShowToast(q<3?'もう一度（明日）':'次回 '+intv+'日後');
+    render();
+  };
+  window.rcValidate=function(){
+    rcParsed=null;
+    var ta=document.getElementById('rcTa'); if(!ta)return;
+    var obj; try{ obj=JSON.parse(ta.value); }catch(e){ rcMsgShow('err','JSON構文エラー: '+e.message); return; }
+    var errs=RL.validateImport(obj);
+    if(errs.length){ rcMsgShow('err','検証エラー（'+errs.length+'件）: '+errs.join(' / ')); return; }
+    rcParsed=obj;
+    var n=0,u=0,s=0;
+    obj.cards.forEach(function(c){ var ex=recallStore.get(c.id); if(!ex)n++; else (ex.answer!==c.answer||ex.prompt!==c.prompt)?u++:s++; });
+    rcDiff={n:n,u:u,s:s};
+    rcMsgShow('ok','✓ 契約に適合（'+obj.cards.length+'枚 / 出典: '+rcEsc(obj.source)+'）');
+    render();
+  };
+  window.rcDoMerge=function(){
+    if(!rcParsed)return;
+    var r=recallStore.import(rcParsed);
+    if(!r.ok){ rcShowToast('取り込み失敗'); return; }
+    rcShowToast('✓ 新規'+r.added+' / 更新'+r.updated);
+    rcParsed=null; rcTab='review'; render();
+  };
+  window.rcSample=function(){
+    var ta=document.getElementById('rcTa'); if(!ta)return;
+    ta.value=JSON.stringify({format:"grow-recall-cards",version:1,source:"統計検定準1級 サンプル 問1",created:today(),cards:[
+      {id:"cc65a88f",type:"free_recall",tags:["検定","t分布"],prompt:"母分散が未知のとき、zでなくtを使う理由を説明せよ",answer:"標本から $s$ を推定する分ばらつきが大きく、裾の重い $t$ 分布（自由度 $n-1$）に従うため。",note:"自由度→∞でtはzに一致"},
+      {id:"74b1a515",type:"cloze",tags:["t分布"],prompt:"自由度 $\nu\to\infty$ で t分布が一致する分布は？",answer:"標準正規分布"},
+      {id:"5a7357b4",type:"cued",tags:["適用条件"],prompt:"対応のある2群の平均差。前提が満たされるとき使う検定は？",answer:"対応のある t 検定（差の母平均 $=0$ を検定）"}
+    ]},null,2);
+    rcParsed=null;
+  };
+  window.rcClearTa=function(){ var ta=document.getElementById('rcTa'); if(ta)ta.value=''; rcParsed=null; };
+  window.rcDel=function(id){ if(!confirm('このカードを削除しますか？'))return; recallStore.delete(id); render(); };
+  window.rcSync=async function(){
+    try{ rcShowToast('同期中…'); var r=await recallStore.sync(); rcShowToast('✓ 同期完了 '+r.total+'枚 / のべ'+r.totalReviews); }
+    catch(e){ rcShowToast('同期エラー: '+e.message); }
+    render();
+  };
+  window.rcReset=async function(){ if(!confirm('台帳の全カードと進捗を削除します。よろしいですか？'))return; recallStore.data=RL._util.emptyStore(); await recallStore._persist(); render(); };
+
   function render(){
     var app=document.getElementById("app");
     app.innerHTML=
       '<div class="header"><div class="logo">GROW \u2726</div>'+
         '<div class="date">'+new Date().toLocaleDateString("ja-JP",{month:"long",day:"numeric",weekday:"long"})+'</div></div>'+
-      '<div class="content">'+(tab==="home"?home():tab==="plan"?plan():diaryView())+'</div>'+
-      (tab!=="home"?'<button class="fab" id="fab">\uFF0B</button>':"")+
+      '<div class="content">'+(tab==="home"?home():tab==="plan"?plan():tab==="diary"?diaryView():recallView())+'</div>'+
+      (tab!=="home"&&tab!=="recall"?'<button class="fab" id="fab">\uFF0B</button>':"")+
       (showSheet==="task"?taskSheet():showSheet==="diary"?diarySheet():"")+
       '<div class="tabbar">'+
-        [["home","\uD83C\uDFE0","\u30db\u30fc\u30e0"],["plan","\uD83D\uDCCA","\u8a08\u753b"],["diary","\uD83D\uDCD4","\u65e5\u8a18"]].map(function(x){
+        [["home","\uD83C\uDFE0","\u30db\u30fc\u30e0"],["plan","\uD83D\uDCCA","\u8a08\u753b"],["diary","\uD83D\uDCD4","\u65e5\u8a18"],["recall","\uD83E\uDDE0","\u60F3\u8D77"]].map(function(x){
           return'<button class="tab '+(tab===x[0]?"on":"")+'" data-tab="'+x[0]+'"><span class="ic">'+x[1]+'</span>'+x[2]+'</button>';}).join("")+
       '</div>';
     bind();
