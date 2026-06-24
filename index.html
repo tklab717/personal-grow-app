@@ -458,7 +458,7 @@
   function blankDiary(){return{id:null,date:today(),mood:3,text:"",taskIds:[],coachLog:[]};}
   function load(k,d){try{return JSON.parse(localStorage.getItem(k))||d}catch(e){return d}}
   function save(){localStorage.setItem(TKEY,JSON.stringify(tasks));localStorage.setItem(DKEY,JSON.stringify(diary));localStorage.setItem(GKEY,JSON.stringify(goals));scheduleAutoSave();}
-  var GROW_VERSION = "2026.06.25a"; // タイムゾーン修正
+  var GROW_VERSION = "2026.06.25b"; // タイムゾーン修正
   function today(){return new Date().toISOString().slice(0,10);}
   function addDays(iso,n){var d=new Date(iso);d.setDate(d.getDate()+n);return d.toISOString().slice(0,10);}
   function dayDiff(a,b){return Math.round((new Date(b)-new Date(a))/864e5);}
@@ -1248,6 +1248,8 @@
           return'<button class="tab '+(tab===x[0]?"on":"")+'" data-tab="'+x[0]+'"><span class="ic">'+x[1]+'</span>'+x[2]+'</button>';}).join("")+
       '</div>';
     bind();
+    // recallタブのKaTeXレンダリング（bind後にDOMが確定している）
+    if(tab==="recall"){ var appEl=document.getElementById("app"); if(appEl) km(appEl); }
   }
 
   function bind(){
