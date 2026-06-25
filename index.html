@@ -458,7 +458,7 @@
   function blankDiary(){return{id:null,date:today(),mood:3,text:"",taskIds:[],coachLog:[]};}
   function load(k,d){try{return JSON.parse(localStorage.getItem(k))||d}catch(e){return d}}
   function save(){localStorage.setItem(TKEY,JSON.stringify(tasks));localStorage.setItem(DKEY,JSON.stringify(diary));localStorage.setItem(GKEY,JSON.stringify(goals));scheduleAutoSave();}
-  var GROW_VERSION = "2026.06.25b"; // タイムゾーン修正
+  var GROW_VERSION = "2026.06.25c"; // タイムゾーン修正
   function today(){return new Date().toISOString().slice(0,10);}
   function addDays(iso,n){var d=new Date(iso);d.setDate(d.getDate()+n);return d.toISOString().slice(0,10);}
   function dayDiff(a,b){return Math.round((new Date(b)-new Date(a))/864e5);}
@@ -1007,6 +1007,15 @@
    * ================================================================ */
   function km(el){ if(window.renderMathInElement) renderMathInElement(el,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}],throwOnError:false}); }
   function rcEsc(s){ return String(s).replace(/[&<>]/g,function(m){return({'&':'&amp;','<':'&lt;','>':'&gt;'}[m]);}); }
+  // エスケープ後に軽量Markdownを適用（**太字** *斜体* `コード` 改行）。KaTeXの $...$ は触らない。
+  function rcFmt(s){
+    var t = rcEsc(s);
+    t = t.replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>');                 // **太字**
+    t = t.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>'); // *斜体*
+    t = t.replace(/`([^`]+)`/g, '<code style="background:#eef2f7;padding:1px 4px;border-radius:4px;font-size:.92em;">$1</code>'); // `コード`
+    t = t.replace(/\n/g, '<br>');                                   // 改行
+    return t;
+  }
 
   function recallView(){
     var rs = recallStore;
@@ -1040,7 +1049,7 @@
     var revealed = !!document.getElementById('rcAns');
     return '<div style="background:#fff;border:1px solid #dce3ec;border-radius:14px;padding:15px;" id="rcCard">' +
       '<div style="font-size:10.5px;font-weight:700;background:#fbf3e0;color:#c08a2d;padding:1px 8px;border-radius:99px;display:inline-block;margin-bottom:8px;">'+rcEsc(rcCur.type)+'</div>' +
-      '<div id="rcQ" style="font-size:16px;font-weight:700;line-height:1.7;margin-bottom:12px;">'+rcEsc(rcCur.prompt)+'</div>' +
+      '<div id="rcQ" style="font-size:16px;font-weight:700;line-height:1.7;margin-bottom:12px;">'+rcFmt(rcCur.prompt)+'</div>' +
       '<div style="display:flex;gap:7px;">' +
         '<button onclick="rcReveal()" id="rcRevBtn" style="border:none;border-radius:9px;padding:10px 14px;font-size:13px;font-weight:700;background:#3a6ea8;color:#fff;">答えを表示</button>' +
         '<span style="font-size:11.5px;color:#9aa6b6;margin-top:auto;padding-bottom:2px;">残り'+q.length+'問</span>' +
@@ -1104,7 +1113,7 @@
   function rcSetTab(t){ rcTab=t; rcParsed=null; render(); }
   function rcReveal(){
     var ans=document.getElementById('rcAns'); if(!ans||!rcCur)return;
-    ans.innerHTML=rcEsc(rcCur.answer)+(rcCur.note?'<div style="margin-top:7px;font-size:12.5px;color:#c08a2d;">💡 '+rcEsc(rcCur.note)+'</div>':'');
+    ans.innerHTML=rcFmt(rcCur.answer)+(rcCur.note?'<div style="margin-top:7px;font-size:12.5px;color:#c08a2d;">💡 '+rcFmt(rcCur.note)+'</div>':'');
     km(ans); ans.style.display='block';
     var rb=document.getElementById('rcRevBtn'); if(rb)rb.style.display='none';
     var gr=document.getElementById('rcGrades'); if(gr){
@@ -1179,7 +1188,7 @@
   window.rcSetTab=function(t){rcTab=t;rcParsed=null;render();};
   window.rcReveal=function(){
     var ans=document.getElementById('rcAns'); if(!ans||!rcCur)return;
-    ans.innerHTML=rcEsc(rcCur.answer)+(rcCur.note?'<div style="margin-top:7px;font-size:12.5px;color:#c08a2d;">💡 '+rcEsc(rcCur.note)+'</div>':'');
+    ans.innerHTML=rcFmt(rcCur.answer)+(rcCur.note?'<div style="margin-top:7px;font-size:12.5px;color:#c08a2d;">💡 '+rcFmt(rcCur.note)+'</div>':'');
     km(ans); ans.style.display='block';
     var rb=document.getElementById('rcRevBtn'); if(rb)rb.style.display='none';
     var gr=document.getElementById('rcGrades'); if(gr){
